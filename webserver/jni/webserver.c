@@ -15,7 +15,7 @@
 #define OOM_ADJ_PATH    "/proc/self/oom_score_adj"
 #define OOM_ADJ_NOKILL  -17
 
-static int s_sig_num = 0;
+static volatile sig_atomic_t s_sig_num = 0;
 
 struct settings {
     bool init;
@@ -27,7 +27,10 @@ struct settings {
 };
 
 static void fn(struct mg_connection *c, int ev, void *ev_data) {
-    if (ev == MG_EV_HTTP_MSG && c->fn_data != NULL) {
+    if (ev == MG_EV_ACCEPT && c->is_tls && c->fn_data != NULL) {
+        struct settings *s = (struct settings *) c->fn_data;
+        mg_tls_init(c, &s->tls_opts);
+    } else if (ev == MG_EV_HTTP_MSG && c->fn_data != NULL) {
         struct mg_http_message *hm = (struct mg_http_message *) ev_data;
         struct settings *s = (struct settings *) c->fn_data;
         if (mg_strcmp(hm->uri, mg_str("/internal-test")) == 0) {
@@ -44,41 +47,51 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
     }
 }
 
-static void tls_fn(struct mg_connection *c, int ev, void *ev_data) {
-    if (ev == MG_EV_ACCEPT && c->fn_data != NULL) {
-        struct settings *s = (struct settings *) c->fn_data;
-        mg_tls_init(c, &s->tls_opts);
-    } else {
-        fn(c, ev, ev_data);
-    }
-}
-
 static void signal_handler(int sig_num) {
-    signal(sig_num, signal_handler);
     s_sig_num = sig_num;
 }
 
+void setup_signal_handler() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
 /*
- * Tell the kernel's out-of-memory killer to avoid this process.
+ * Tells the kernel's out-of-memory killer to avoid this process.
  */
 void oom_adjust_setup(void) {
     FILE *fp;
-    int oom_score = INT_MIN;
-    if ((fp = fopen(OOM_ADJ_PATH, "r+")) != NULL) {
-        if (fscanf(fp, "%d", &oom_score) != 1)
-            __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "error reading %s: %s", OOM_ADJ_PATH,
-                                strerror(errno));
-        else {
-            rewind(fp);
-            if (fprintf(fp, "%d\n", OOM_ADJ_NOKILL) <= 0)
-                __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "error writing %s: %s",
-                                    OOM_ADJ_PATH, strerror(errno));
-            else
-                __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "Set %s from %d to %d",
-                                    OOM_ADJ_PATH, oom_score, OOM_ADJ_NOKILL);
-        }
-        fclose(fp);
+    char buf[32];
+    if ((fp = fopen(OOM_ADJ_PATH, "r+")) == NULL) {
+        __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "error opening %s: %s", OOM_ADJ_PATH,
+                            strerror(errno));
+        return;
     }
+    if (fgets(buf, sizeof(buf), fp) == NULL) {
+        __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "error reading %s: %s", OOM_ADJ_PATH,
+                            strerror(errno));
+        return;
+    }
+    char *end_ptr;
+    errno = 0;
+    int oom_score = (int) strtol(buf, &end_ptr, 10);
+    if (end_ptr == buf || errno != 0) {
+        __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "error reading %s: %s", OOM_ADJ_PATH,
+                            strerror(errno));
+    } else if (OOM_ADJ_NOKILL < oom_score) {
+        rewind(fp);
+        if (fprintf(fp, "%d\n", OOM_ADJ_NOKILL) <= 0) {
+            __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "error writing %s: %s",
+                                OOM_ADJ_PATH, strerror(errno));
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "Set %s from %d to %d",
+                                OOM_ADJ_PATH, oom_score, OOM_ADJ_NOKILL);
+        }
+    }
+    fclose(fp);
 }
 
 struct settings parse_cli_parameters(int argc, char *argv[]) {
@@ -139,15 +152,13 @@ int main(int argc, char *argv[]) {
         __android_log_print(ANDROID_LOG_FATAL, THIS_FILE, "Failed to listen on http port.");
         return EXIT_FAILURE;
     }
-    https_connection = mg_http_listen(&mgr, HTTPS_URL, tls_fn, &s);
+    https_connection = mg_http_listen(&mgr, HTTPS_URL, fn, &s);
     if (https_connection == NULL) {
         __android_log_print(ANDROID_LOG_FATAL, THIS_FILE, "Failed to listen on https port.");
         return EXIT_FAILURE;
     }
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
+    setup_signal_handler();
     __android_log_print(ANDROID_LOG_INFO, THIS_FILE, "Starting server.");
     while (s_sig_num == 0) {
         mg_mgr_poll(&mgr, 1000);
